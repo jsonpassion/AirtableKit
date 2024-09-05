@@ -1,6 +1,13 @@
 import Combine
 import Foundation
 
+
+/// This allows to hold records array and offset value
+struct AirtableResponse {
+    var records: [Record] = []
+    var offset: String? = ""
+}
+
 /// Client used to manipulate an Airtable base.
 ///
 /// This is the facade of the library, used to create, modify and get records and attachments from an Airtable base.
@@ -37,11 +44,48 @@ public final class Airtable {
     /// - Parameters:
     ///   - tableName: Name of the table to list records from.
     ///   - fields: Names of the fields that should be included in the response.
-    public func list(tableName: String, fields: [String] = []) -> AnyPublisher<[Record], AirtableError> {
-        let queryItems = fields.isEmpty ? nil : fields.map { URLQueryItem(name: "fields[]", value: $0) }
-        let request = buildRequest(method: "GET", path: tableName, queryItems: queryItems)
+    @available(iOS 14.0, *)
+    public func list(tableName: String, fields: [String] = [], view: String? = nil) -> AnyPublisher<[Record], AirtableError> {
         
-        return performRequest(request, decoder: responseDecoder.decodeRecords(data:))
+        let pageOffsetPublisher = CurrentValueSubject<String?, Never>(nil)
+        
+        return pageOffsetPublisher
+            .flatMap({ offset in
+                return self.loadPage( tableName: tableName, fields: fields, view: view, withOffset: offset)
+            })
+            .handleEvents(receiveOutput: { (response: AirtableResponse) in
+                if response.offset != nil {
+                    pageOffsetPublisher.send(response.offset)
+                } else {
+                    pageOffsetPublisher.send(completion: .finished)
+                }
+            })
+            .reduce([Record](), { allRecords, response in
+                return response.records + allRecords
+            })
+            .eraseToAnyPublisher()
+    }
+    
+    private func loadPage(tableName: String, fields: [String] = [], view: String? = nil, withOffset offset: String?) -> AnyPublisher<AirtableResponse, AirtableError>  {
+        
+        var queryItems: [URLQueryItem]? = fields.isEmpty ? nil : fields.map { URLQueryItem(name: "fields[]", value: $0) }
+        
+        if let view = view {
+            let viewQueryItem = URLQueryItem(name: "view", value: view)
+            queryItems?.insert(viewQueryItem, at: 0)
+        }
+        
+        guard let request = buildRequest(method: "GET", path: tableName, queryItems: queryItems, offset: offset) else {
+            let error = AirtableError.invalidParameters(operation: #function, parameters: [String(describing: queryItems)])
+            return Fail(error: error).eraseToAnyPublisher()
+        }
+        let publisher = URLSession.shared.dataTaskPublisher(for: request)
+            .tryMap(errorHander.mapResponse(_:))
+            .tryMap( responseDecoder.decodeRecordsWithOffset(data:) )
+            .mapError(errorHander.mapError(_:))
+            .eraseToAnyPublisher()
+        
+        return publisher
     }
     
     /// Gets a single record in a table.
@@ -190,12 +234,17 @@ extension Airtable {
             .eraseToAnyPublisher()
     }
     
-    func buildRequest(method: String, path: String, queryItems: [URLQueryItem]? = nil, payload: [String: Any]? = nil) -> URLRequest? {
+    func buildRequest(method: String, path: String, queryItems: [URLQueryItem]? = nil, payload: [String: Any]? = nil, offset: String? = nil) -> URLRequest? {
         let url: URL?
+        var parameters = queryItems ?? [URLQueryItem]()
         
-        if let queryItems = queryItems {
+        if let offsetString = offset {
+            let queryItem = URLQueryItem(name: "offset", value: offsetString)
+            parameters.insert(queryItem, at: 0)
+        }
+        if !parameters.isEmpty {
             var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
-            components?.queryItems = queryItems
+            components?.queryItems = parameters
             url = components?.url
         } else {
             url = baseURL.appendingPathComponent(path)
@@ -215,7 +264,6 @@ extension Airtable {
                 return nil
             }
         }
-        
         return request
     }
 }
